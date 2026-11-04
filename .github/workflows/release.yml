@@ -43,10 +43,17 @@ jobs:
           echo "tag=v${NEXT_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Resolved next version: ${NEXT_VERSION} (tag: v${NEXT_VERSION})"
 
+      - name: Inspect OIDC token claims
+        run: |
+          TOKEN=$(curl -sSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
+          PAYLOAD=$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null || true)
+          echo "OIDC Claims (iss, aud, sub):"
+          echo "$PAYLOAD" | jq '{iss, aud, sub, repository, repository_visibility}'
+
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN || 'arn:aws:iam::030454160336:role/exam-github-actions-ecr' }}
+          role-to-assume: arn:aws:iam::030454160336:role/exam-github-actions-ecr
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
