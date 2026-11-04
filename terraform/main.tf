@@ -25,6 +25,15 @@ variable "github_repo" {
 }
 
 data "aws_caller_identity" "current" {}
+data "aws_vpc" "default" {
+  default = true
+}
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
 
 # 1. Amazon ECR Repository
 resource "aws_ecr_repository" "app" {
@@ -40,7 +49,7 @@ resource "aws_ecr_repository" "app" {
 resource "aws_iam_openid_connect_provider" "github" {
   url             = "https://token.actions.githubusercontent.com"
   client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+  thumbprint_list = ["ab9d0263244dd0326eb67015705a667e79cfe998"]
 }
 
 # 3. IAM Role for GitHub Actions (with exam-* prefix & candidate-exam-boundary)
@@ -75,9 +84,14 @@ resource "aws_iam_role_policy_attachment" "github_actions_ecr_poweruser" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser"
 }
 
-# 4. IAM Role for AWS App Runner to pull from ECR
-resource "aws_iam_role" "apprunner_ecr_access" {
-  name                 = "exam-apprunner-ecr-access"
+resource "aws_iam_role_policy_attachment" "github_actions_ecs_full" {
+  role       = aws_iam_role.github_actions_ecr.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonECS_FullAccess"
+}
+
+# 4. IAM Task Execution Role for ECS Fargate
+resource "aws_iam_role" "ecs_task_execution" {
+  name                 = "exam-ecs-task-execution-role"
   permissions_boundary = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/candidate-exam-boundary"
 
   assume_role_policy = jsonencode({
@@ -86,7 +100,7 @@ resource "aws_iam_role" "apprunner_ecr_access" {
       {
         Effect = "Allow"
         Principal = {
-          Service = "build.apprunner.amazonaws.com"
+          Service = "ecs-tasks.amazonaws.com"
         }
         Action = "sts:AssumeRole"
       }
@@ -94,36 +108,71 @@ resource "aws_iam_role" "apprunner_ecr_access" {
   })
 }
 
-resource "aws_iam_role_policy_attachment" "apprunner_ecr_policy" {
-  role       = aws_iam_role.apprunner_ecr_access.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess"
+resource "aws_iam_role_policy_attachment" "ecs_task_execution_policy" {
+  role       = aws_iam_role.ecs_task_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# 5. AWS App Runner Service (auto-deploys whenever :latest is pushed to ECR)
-resource "aws_apprunner_service" "app" {
-  service_name = "mentee-interview-service"
+# 5. Security Group allowing HTTP traffic on port 8080
+resource "aws_security_group" "ecs_sg" {
+  name        = "mentee-interview-sg"
+  description = "Allow HTTP inbound traffic on port 8080"
+  vpc_id      = data.aws_vpc.default.id
 
-  source_configuration {
-    authentication_configuration {
-      access_role_arn = aws_iam_role.apprunner_ecr_access.arn
-    }
-    image_repository {
-      image_identifier      = "${aws_ecr_repository.app.repository_url}:latest"
-      image_repository_type = "ECR"
-      image_configuration {
-        port = "8080"
-      }
-    }
-    auto_deployments_enabled = true
+  ingress {
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
-  health_check_configuration {
-    protocol = "HTTP"
-    path     = "/health"
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 }
 
-output "service_url" {
-  description = "Live URL of the deployed App Runner service"
-  value       = "https://${aws_apprunner_service.app.service_url}"
+# 6. Amazon ECS Fargate Cluster, Task Definition & Service
+resource "aws_ecs_cluster" "main" {
+  name = "mentee-interview-cluster"
+}
+
+resource "aws_ecs_task_definition" "app" {
+  family                   = "mentee-interview-task"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "mentee-interview"
+      image     = "${aws_ecr_repository.app.repository_url}:latest"
+      essential = true
+      portMappings = [
+        {
+          containerPort = 8080
+          hostPort      = 8080
+          protocol      = "tcp"
+        }
+      ]
+    }
+  ])
+}
+
+resource "aws_ecs_service" "app" {
+  name            = "mentee-interview-service"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.app.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = data.aws_subnets.default.ids
+    security_groups  = [aws_security_group.ecs_sg.id]
+    assign_public_ip = true
+  }
 }

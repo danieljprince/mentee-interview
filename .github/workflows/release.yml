@@ -20,6 +20,8 @@ env:
   AWS_REGION: eu-west-2
   ECR_REGISTRY: 030454160336.dkr.ecr.eu-west-2.amazonaws.com
   ECR_REPOSITORY: mentee-interview-registry
+  ECS_CLUSTER: mentee-interview-cluster
+  ECS_SERVICE: mentee-interview-service
 
 jobs:
   release-and-publish:
@@ -62,6 +64,11 @@ jobs:
           docker tag "${IMAGE_URI}:${ROLLBACK_VERSION}" "${IMAGE_URI}:latest"
           docker push "${IMAGE_URI}:latest"
           echo "Successfully rolled back :latest to ${ROLLBACK_VERSION}"
+          aws ecs update-service \
+            --cluster "${ECS_CLUSTER}" \
+            --service "${ECS_SERVICE}" \
+            --force-new-deployment \
+            --region "${AWS_REGION}" || echo "ECS service not yet created or update skipped"
 
       - name: Determine next release version
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.rollback_version == '' }}
@@ -111,6 +118,16 @@ jobs:
         run: |
           docker push "${IMAGE_URI}:${VERSION}"
           docker push "${IMAGE_URI}:latest"
+
+      - name: Deploy new version to Amazon ECS Fargate
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.rollback_version == '' }}
+        run: |
+          echo "Triggering ECS Fargate rolling deployment for ${ECS_CLUSTER}/${ECS_SERVICE}..."
+          aws ecs update-service \
+            --cluster "${ECS_CLUSTER}" \
+            --service "${ECS_SERVICE}" \
+            --force-new-deployment \
+            --region "${AWS_REGION}" || echo "ECS service '${ECS_SERVICE}' not found yet - create it in ECS console to enable auto-deploy."
 
       - name: Create GitHub Release and Tag
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.rollback_version == '' }}
