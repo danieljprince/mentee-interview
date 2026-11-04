@@ -5,6 +5,12 @@ on:
     branches:
       - main
       - master
+  workflow_dispatch:
+    inputs:
+      rollback_version:
+        description: "Optional version (e.g. 1.0.0) to roll back :latest to"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -17,7 +23,7 @@ env:
 
 jobs:
   release-and-publish:
-    name: Create Release, Build & Push Container
+    name: Test, Build, Release & Push Container
     runs-on: ubuntu-latest
 
     steps:
@@ -26,7 +32,39 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run unit tests (stops release on failure)
+        run: python -m unittest discover -v
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::030454160336:role/exam-github-actions-ecr
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Rollback to previous version
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.rollback_version != '' }}
+        env:
+          ROLLBACK_VERSION: ${{ inputs.rollback_version }}
+          IMAGE_URI: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
+        run: |
+          echo "Rolling back :latest to version ${ROLLBACK_VERSION}..."
+          docker pull "${IMAGE_URI}:${ROLLBACK_VERSION}"
+          OUTPUT=$(docker run --rm "${IMAGE_URI}:${ROLLBACK_VERSION}" --version)
+          echo "Verified rollback image output: ${OUTPUT}"
+          docker tag "${IMAGE_URI}:${ROLLBACK_VERSION}" "${IMAGE_URI}:latest"
+          docker push "${IMAGE_URI}:latest"
+          echo "Successfully rolled back :latest to ${ROLLBACK_VERSION}"
+
       - name: Determine next release version
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.rollback_version == '' }}
         id: semver
         run: |
           git fetch --tags --force
@@ -43,23 +81,8 @@ jobs:
           echo "tag=v${NEXT_VERSION}" >> "$GITHUB_OUTPUT"
           echo "Resolved next version: ${NEXT_VERSION} (tag: v${NEXT_VERSION})"
 
-      - name: Inspect OIDC token claims
-        run: |
-          TOKEN=$(curl -sSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
-          PAYLOAD=$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null || true)
-          echo "OIDC Claims (iss, aud, sub):"
-          echo "$PAYLOAD" | jq '{iss, aud, sub, repository, repository_visibility}'
-
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::030454160336:role/exam-github-actions-ecr
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
-
       - name: Build, verify, and tag Docker image
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.rollback_version == '' }}
         env:
           VERSION: ${{ steps.semver.outputs.version }}
           IMAGE_URI: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
@@ -73,7 +96,7 @@ jobs:
             .
 
           # Verify container outputs the exact matching version
-          OUTPUT=$(docker run --rm "${ECR_REPOSITORY}:${VERSION}")
+          OUTPUT=$(docker run --rm "${ECR_REPOSITORY}:${VERSION}" --version)
           echo "Container output: ${OUTPUT}"
           if [[ "${OUTPUT}" != *"${VERSION}"* ]]; then
             echo "Error: Container app version output ('${OUTPUT}') does not match expected version '${VERSION}'"
@@ -81,6 +104,7 @@ jobs:
           fi
 
       - name: Push Docker image to Amazon ECR
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.rollback_version == '' }}
         env:
           VERSION: ${{ steps.semver.outputs.version }}
           IMAGE_URI: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
@@ -89,6 +113,7 @@ jobs:
           docker push "${IMAGE_URI}:latest"
 
       - name: Create GitHub Release and Tag
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.rollback_version == '' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.semver.outputs.tag }}

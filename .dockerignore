@@ -11,3 +11,5 @@ venv
 .venv
 README.md
 *.md
+test_*.py
+terraform/
