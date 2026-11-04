@@ -1,0 +1,89 @@
+name: Release & Push to ECR
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  AWS_REGION: eu-west-2
+  ECR_REGISTRY: 030454160336.dkr.ecr.eu-west-2.amazonaws.com
+  ECR_REPOSITORY: mentee-interview-registry
+
+jobs:
+  release-and-publish:
+    name: Create Release, Build & Push Container
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine next release version
+        id: semver
+        run: |
+          git fetch --tags --force
+          LATEST_TAG=$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname | head -n 1)
+          if [ -z "$LATEST_TAG" ]; then
+            NEXT_VERSION="1.0.0"
+          else
+            VERSION_WITHOUT_V="${LATEST_TAG#v}"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION_WITHOUT_V"
+            PATCH=$((PATCH + 1))
+            NEXT_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          fi
+          echo "version=${NEXT_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${NEXT_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved next version: ${NEXT_VERSION} (tag: v${NEXT_VERSION})"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || 'arn:aws:iam::030454160336:role/exam-github-actions-ecr' }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, verify, and tag Docker image
+        env:
+          VERSION: ${{ steps.semver.outputs.version }}
+          IMAGE_URI: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
+        run: |
+          docker build \
+            --build-arg APP_VERSION="${VERSION}" \
+            -t "${ECR_REPOSITORY}:${VERSION}" \
+            -t "${ECR_REPOSITORY}:latest" \
+            -t "${IMAGE_URI}:${VERSION}" \
+            -t "${IMAGE_URI}:latest" \
+            .
+
+          # Verify container outputs the exact matching version
+          OUTPUT=$(docker run --rm "${ECR_REPOSITORY}:${VERSION}")
+          echo "Container output: ${OUTPUT}"
+          if [[ "${OUTPUT}" != *"${VERSION}"* ]]; then
+            echo "Error: Container app version output ('${OUTPUT}') does not match expected version '${VERSION}'"
+            exit 1
+          fi
+
+      - name: Push Docker image to Amazon ECR
+        env:
+          VERSION: ${{ steps.semver.outputs.version }}
+          IMAGE_URI: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
+        run: |
+          docker push "${IMAGE_URI}:${VERSION}"
+          docker push "${IMAGE_URI}:latest"
+
+      - name: Create GitHub Release and Tag
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.semver.outputs.tag }}
+          name: Release ${{ steps.semver.outputs.tag }}
+          generate_release_notes: true
